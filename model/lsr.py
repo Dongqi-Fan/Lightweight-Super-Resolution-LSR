@@ -8,55 +8,64 @@ from scipy import ndimage
 import torchvision
 
 
-def high_pass_filters(x):
-    gauss = x.contiguous()
-    filter = torchvision.transforms.GaussianBlur(15, sigma=5)
-    gauss = filter(gauss)
-    h_pass = x - gauss
-    return h_pass
-
-
-class ConvBNReLU(nn.Sequential):
+class ConvReLU(nn.Sequential):
     def __init__(self, in_channel, out_channel, kernel_size=3, stride=1, groups=1):
         padding = (kernel_size - 1) // 2
-        super(ConvBNReLU, self).__init__(
+        super(ConvReLU, self).__init__(
             nn.Conv2d(in_channel, out_channel, kernel_size, stride, padding, groups=groups, bias=False),
             nn.ReLU()
         )
 
 
 class LSR(nn.Module):
-    def __init__(self, num_channels=1, d=45, s=18, m=4):  # s原来为12
+    def __init__(self, num_channels=1, d=45, s=18):
         super(LSR, self).__init__()
-        self.first_part = nn.Conv2d(num_channels, d, kernel_size=3, padding=3 // 2, bias=False)
-        self.prelu1 = nn.PReLU(d)
-        self.mid_part = [DSLayer(d, s)]  # 56*56*1*1+3*3*56+12*1*1=3652
-        for i in range(m):
-            self.mid_part.extend([DSLayer1(s, s, i + 1)])  # 12*12*1*1+3*3*12+12*1*1=264
-            self.mid_part.extend([CALayer(s, i + 1)])  # 12*12*1*1=144
-        self.mid_part.extend([nn.Conv2d(s, 4, kernel_size=1, bias=False)])
-        self.prelu2 = nn.PReLU(4)
-        self.mid_part = nn.Sequential(*self.mid_part)
-        self.last_part = nn.PixelShuffle(2)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(num_channels, d, kernel_size=3, padding=3 // 2, bias=False),
+            nn.PReLU(d)
+        )
+        self.LDS_A = LDS_A(d, s)
+        
+        self.LDSCA1 = nn.Sequential(
+            LDS_B(s, s),
+            CALayer(s)
+        )
+        self.LDSCA2 = nn.Sequential(
+            LDS_B(s, s),
+            CALayer(s)
+        )
+        self.LDSCA3 = nn.Sequential(
+            LDS_B(s, s),
+            CALayer(s)
+        )
+        self.LDSCA4 = nn.Sequential(
+            LDS_B(s, s),
+            CALayer(s)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(s, 4, kernel_size=1, bias=False),
+            nn.PReLU(4)
+        )
+        self.upsample = nn.PixelShuffle(2)
 
     def forward(self, x):
-        x = self.first_part(x)
-        x = self.prelu1(x)
-        x = self.mid_part[0](x)
+        x = self.conv1(x)
+        x = self.LDS_A(x)
 
-        for i in range(1, 9, 1):
-            x = self.mid_part[i](x)
+        x = self.LDSCA1(x)
+        x = self.LDSCA2(x)
+        x = self.LDSCA3(x)
+        x = self.LDSCA4(x)
 
-        x = self.mid_part[9](x)
-        x = self.prelu2(x)
-        x = self.last_part(x)
+        x = self.conv2(x)
+        x = self.upsample(x)
         return x
 
 
-class CALayer(nn.Module):  # version 2
-    def __init__(self, channel, i):
+class CALayer(nn.Module):
+    def __init__(self, channel):
         super(CALayer, self).__init__()
-        self.k = i
         self.g = nn.Sequential(nn.Conv2d(channel, channel, 1, padding=0, bias=False))
         self.v = nn.Sequential(nn.Conv2d(channel, channel, 1, padding=0, bias=False))
         self.z = nn.Sequential(nn.Conv2d(channel, channel, 1, padding=0, bias=False))
@@ -70,43 +79,40 @@ class CALayer(nn.Module):  # version 2
         return x + out
 
 
-class DSLayer(nn.Module):
+class LDS_A(nn.Module):
     def __init__(self, in_channel, out_channel):
-        super(DSLayer, self).__init__()
+        super(LDS_A, self).__init__()
 
-        layers = [ConvBNReLU(in_channel, 36, kernel_size=1)]
-        layers.extend([ConvBNReLU(36, 36, stride=1, groups=36)])
+        layers = [ConvReLU(in_channel, 36, kernel_size=1)]
+        layers.extend([ConvReLU(36, 36, stride=1, groups=36)])
         layers.extend([nn.Conv2d(36, out_channel, kernel_size=1, bias=False)])
 
-        self.conv = nn.Sequential(*layers)
-        for m in self.conv:
+        self.layers = nn.Sequential(*layers)
+        for m in self.layers:
             if isinstance(m, nn.Conv2d):
                 nn.init.normal_(m.weight.data, mean=0.0,
                                 std=math.sqrt(2 / (m.out_channels * m.weight.data[0][0].numel())))
 
     def forward(self, x):
-        x = self.conv[0](x)
-        x = self.conv[1](x)
-        x = self.conv[2](x)
+        x = self.layers(x)
         return x
 
 
-class DSLayer1(nn.Module):
-    def __init__(self, in_channel, out_channel, i):
-        super(DSLayer1, self).__init__()
+class LDS_B(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(LDS_B, self).__init__()
         self.out_channel = out_channel
-        layers = [ConvBNReLU(in_channel, in_channel, stride=1, groups=in_channel)]
+        layers = [ConvReLU(in_channel, in_channel, stride=1, groups=in_channel)]
         layers.extend([nn.Conv2d(in_channel, out_channel, kernel_size=1, bias=False)])
-        self.conv = nn.Sequential(*layers)
+        self.layers = nn.Sequential(*layers)
 
-        for m in self.conv:
+        for m in self.layers:
             if isinstance(m, nn.Conv2d):
                 nn.init.normal_(m.weight.data, mean=0.0,
                                 std=math.sqrt(2 / (m.out_channels * m.weight.data[0][0].numel())))
 
     def forward(self, x):
         res = x
-        x = self.conv[0](x)
-        x = self.conv[1](x)
+        x = self.layers(X)
         return x + res
 
